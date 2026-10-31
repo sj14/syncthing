@@ -7,14 +7,19 @@
 package model
 
 import (
+	"bytes"
+	"cmp"
+	"context"
 	"path/filepath"
 	"slices"
+	"sync"
 	"testing"
 
 	"github.com/d4l3k/messagediff"
 
 	"github.com/syncthing/syncthing/lib/build"
 	"github.com/syncthing/syncthing/lib/config"
+	"github.com/syncthing/syncthing/lib/events"
 	"github.com/syncthing/syncthing/lib/fs"
 	"github.com/syncthing/syncthing/lib/protocol"
 	"github.com/syncthing/syncthing/lib/rand"
@@ -182,4 +187,132 @@ func TestSetPlatformData(t *testing.T) {
 	if err := sr.setPlatformData(fi, "file.tmp"); err != nil {
 		t.Error(err)
 	}
+}
+
+func TestEncryptedSuccessors(t *testing.T) {
+	setup := func(t *testing.T, untrusted bool) *sendReceiveFolder {
+		t.Helper()
+		_, f := setupSendReceiveFolder(t)
+		found := false
+		for i := range f.Devices {
+			if f.Devices[i].DeviceID == device1 {
+				found = true
+				if untrusted {
+					f.Devices[i].EncryptionPassword = "secret"
+				}
+			}
+		}
+		if !found {
+			t.Fatal("device1 is not part of the folder")
+		}
+		return f
+	}
+
+	vector := func(counters ...protocol.Counter) protocol.Vector {
+		slices.SortFunc(counters, func(a, b protocol.Counter) int {
+			return cmp.Compare(a.ID, b.ID)
+		})
+		return protocol.Vector{Counters: counters}
+	}
+
+	// writeFiles writes the local file as the global version and the
+	// version of the remote device1, which loses against it by
+	// modification time
+	writeFiles := func(t *testing.T, f *sendReceiveFolder, local, remote protocol.Vector) (protocol.FileInfo, protocol.FileInfo) {
+		t.Helper()
+		file := createEmptyFileInfo(t, "foo", f.Filesystem())
+		file.Version = local
+		must(t, f.updateLocalsFromScanning([]protocol.FileInfo{file}))
+
+		remoteFile := file
+		remoteFile.Version = remote
+		remoteFile.ModifiedS = file.ModifiedS - 10
+		must(t, f.db.Update(f.folderID, device1, []protocol.FileInfo{remoteFile}))
+
+		global, ok, err := f.db.GetGlobalFile(f.folderID, "foo")
+		must(t, err)
+		if !ok || !global.Version.Equal(local) {
+			t.Fatalf("expected the local file to be global, got %v", global.Version)
+		}
+		return file, remoteFile
+	}
+
+	handle := func(t *testing.T, f *sendReceiveFolder) protocol.FileInfo {
+		t.Helper()
+		f.ScheduleEncryptedSuccessors([]string{"foo"})
+		must(t, f.handleEncryptedSuccessors(context.Background()))
+		file, ok, err := f.db.GetDeviceFile(f.folderID, protocol.LocalDeviceID, "foo")
+		must(t, err)
+		if !ok {
+			t.Fatal("local file is missing")
+		}
+		return file
+	}
+
+	// The local file is the global version after a rescan with an empty
+	// database; the remote has an older version with a higher sum of
+	// counters
+	rescanned := vector(protocol.Counter{ID: myID.Short(), Value: 2500})
+	older := vector(protocol.Counter{ID: myID.Short(), Value: 1000}, protocol.Counter{ID: device2.Short(), Value: 2000})
+
+	t.Run("stuck file gets a successor", func(t *testing.T) {
+		f := setup(t, true)
+		file, _ := writeFiles(t, f, rescanned, older)
+
+		bumped := handle(t, f)
+		if got := bumped.Version.Compare(file.Version); got != protocol.Greater {
+			t.Fatalf("expected a Greater version, got %v (%v)", got, bumped.Version)
+		}
+		if bumped.ModifiedS != file.ModifiedS || bumped.Size != file.Size || !bytes.Equal(bumped.BlocksHash, file.BlocksHash) {
+			t.Error("expected only the version to change")
+		}
+
+		// The successor is enough, no further one is created
+		if again := handle(t, f); !again.Version.Equal(bumped.Version) {
+			t.Errorf("expected no further successor, got %v", again.Version)
+		}
+	})
+
+	t.Run("received index schedules the check", func(t *testing.T) {
+		f := setup(t, true)
+		file, remoteFile := writeFiles(t, f, rescanned, older)
+
+		s := &indexHandler{
+			conn:              device1Conn,
+			downloads:         newDeviceDownloadState(),
+			folder:            f.folderID,
+			remoteIsUntrusted: true,
+			evLogger:          events.NoopLogger,
+			sdb:               f.db,
+			runner:            f,
+			cond:              sync.NewCond(new(sync.Mutex)),
+		}
+		must(t, s.receive([]protocol.FileInfo{remoteFile}, true, "test", 0, 0))
+
+		must(t, f.handleEncryptedSuccessors(context.Background()))
+		bumped, _, err := f.db.GetDeviceFile(f.folderID, protocol.LocalDeviceID, "foo")
+		must(t, err)
+		if got := bumped.Version.Compare(file.Version); got != protocol.Greater {
+			t.Errorf("expected a Greater version, got %v (%v)", got, bumped.Version)
+		}
+	})
+
+	t.Run("trusted remote", func(t *testing.T) {
+		f := setup(t, false)
+		file, _ := writeFiles(t, f, rescanned, older)
+
+		if got := handle(t, f); !got.Version.Equal(file.Version) {
+			t.Errorf("expected no successor, got %v", got.Version)
+		}
+	})
+
+	t.Run("untrusted device will pull", func(t *testing.T) {
+		f := setup(t, true)
+		lower := vector(protocol.Counter{ID: myID.Short(), Value: 1000})
+		file, _ := writeFiles(t, f, rescanned, lower)
+
+		if got := handle(t, f); !got.Version.Equal(file.Version) {
+			t.Errorf("expected no successor, got %v", got.Version)
+		}
+	})
 }

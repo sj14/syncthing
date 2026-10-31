@@ -231,6 +231,131 @@ func TestEncryptedFileInfoConsistency(t *testing.T) {
 	}
 }
 
+// TestEncryptedStalemate reproduces
+// https://github.com/syncthing/syncthing/issues/9884: the untrusted device
+// must pull the version the trusted devices settled on.
+func TestEncryptedStalemate(t *testing.T) {
+	if cryptoIsBrokenUnderRaceDetector {
+		t.Skip("cannot test")
+	}
+
+	const (
+		devA ShortID = 10
+		devB ShortID = 20
+	)
+
+	// The untrusted device has an older version with two counters
+	old := encFileInfo()
+	old.Version = Vector{Counters: []Counter{{ID: devA, Value: 1000}, {ID: devB, Value: 2000}}}
+	old.ModifiedS = 1000
+
+	// devA was re-added with an empty database and rescanned the file
+	rescanned := encFileInfo()
+	rescanned.Version = Vector{Counters: []Counter{{ID: devA, Value: 2500}}}
+	rescanned.ModifiedS = 2000
+
+	if !rescanned.Version.Concurrent(old.Version) || !rescanned.WinsConflict(old) {
+		t.Fatal("expected the trusted devices to settle on the rescanned version")
+	}
+
+	// What the trusted devices announce to the untrusted device
+	announced := rescanned
+	if successor, ok := EncryptedSuccessor(rescanned.Version, []Vector{old.Version}); ok {
+		announced.Version = successor
+	}
+
+	var key [32]byte
+	have := encryptFileInfo(testKeyGen, old, &key)
+	offered := encryptFileInfo(testKeyGen, announced, &key)
+	if got := offered.Version.Compare(have.Version); got != Greater {
+		t.Errorf("untrusted device keeps its version: offered fake version %v, it has %v", offered.Version.HumanString(), have.Version.HumanString())
+	}
+}
+
+func TestEncryptedSuccessor(t *testing.T) {
+	const (
+		devA ShortID = 10
+		devB ShortID = 20
+	)
+	vector := func(counters ...Counter) Vector {
+		return Vector{Counters: counters}
+	}
+
+	t.Run("stuck version gets a successor", func(t *testing.T) {
+		// devA was re-added with an empty database and rescanned the
+		// file, while the untrusted device still has an older version
+		// with a higher sum of counters
+		global := vector(Counter{ID: devA, Value: 2500})
+		untrusted := vector(Counter{ID: devA, Value: 1000}, Counter{ID: devB, Value: 2000})
+
+		successor, ok := EncryptedSuccessor(global, []Vector{untrusted})
+		if !ok {
+			t.Fatal("expected a successor")
+		}
+		if got := successor.Compare(global); got != Greater {
+			t.Errorf("expected successor to be Greater than the global version, got %v", got)
+		}
+		if got, want := encryptedVersionValue(successor), encryptedVersionValue(untrusted)+1; got != want {
+			t.Errorf("expected fake version %d, got %d", want, got)
+		}
+		if !global.Equal(vector(Counter{ID: devA, Value: 2500})) {
+			t.Errorf("global version was modified: %v", global)
+		}
+
+		again, _ := EncryptedSuccessor(global, []Vector{untrusted})
+		if !again.Equal(successor) {
+			t.Errorf("expected the same successor, got %v and %v", successor, again)
+		}
+	})
+
+	t.Run("raises an existing counter", func(t *testing.T) {
+		global := vector(Counter{ID: devA, Value: 100}, Counter{ID: encryptedSuccessorID, Value: 500})
+		untrusted := vector(Counter{ID: devA, Value: 3000}, Counter{ID: devB, Value: 2000})
+
+		successor, ok := EncryptedSuccessor(global, []Vector{untrusted})
+		if !ok {
+			t.Fatal("expected a successor")
+		}
+		if got, want := encryptedVersionValue(successor), encryptedVersionValue(untrusted)+1; got != want {
+			t.Errorf("expected fake version %d, got %d", want, got)
+		}
+		if len(successor.Counters) != 2 {
+			t.Errorf("expected two counters, got %v", successor)
+		}
+	})
+
+	t.Run("highest untrusted version decides", func(t *testing.T) {
+		global := vector(Counter{ID: devA, Value: 2500})
+		lower := vector(Counter{ID: devB, Value: 2600})
+		higher := vector(Counter{ID: devA, Value: 1000}, Counter{ID: devB, Value: 2000})
+
+		successor, ok := EncryptedSuccessor(global, []Vector{lower, higher})
+		if !ok {
+			t.Fatal("expected a successor")
+		}
+		if got, want := encryptedVersionValue(successor), encryptedVersionValue(higher)+1; got != want {
+			t.Errorf("expected fake version %d, got %d", want, got)
+		}
+	})
+
+	t.Run("no successor when the untrusted device will pull", func(t *testing.T) {
+		global := vector(Counter{ID: devA, Value: 1000}, Counter{ID: devB, Value: 2000})
+		untrusted := vector(Counter{ID: devA, Value: 2500})
+
+		if _, ok := EncryptedSuccessor(global, []Vector{untrusted}); ok {
+			t.Error("expected no successor")
+		}
+	})
+
+	t.Run("no successor without untrusted versions", func(t *testing.T) {
+		global := vector(Counter{ID: devA, Value: 1000})
+
+		if _, ok := EncryptedSuccessor(global, nil); ok {
+			t.Error("expected no successor")
+		}
+	})
+}
+
 func TestIsEncryptedParent(t *testing.T) {
 	comp := rand.String(maxPathComponent)
 	cases := []struct {

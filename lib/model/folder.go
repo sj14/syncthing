@@ -80,6 +80,10 @@ type folder struct {
 	forcedRescanPaths     map[string]struct{}
 	forcedRescanPathsMut  sync.Mutex
 
+	encryptedSuccessorRequested chan struct{}
+	encryptedSuccessorPaths     map[string]struct{}
+	encryptedSuccessorPathsMut  sync.Mutex
+
 	watchCancel      context.CancelFunc
 	watchChan        chan []string
 	restartWatchChan chan struct{}
@@ -131,6 +135,9 @@ func newFolder(model *model, ignores *ignore.Matcher, cfg config.FolderConfigura
 
 		forcedRescanRequested: make(chan struct{}, 1),
 		forcedRescanPaths:     make(map[string]struct{}),
+
+		encryptedSuccessorRequested: make(chan struct{}, 1),
+		encryptedSuccessorPaths:     make(map[string]struct{}),
 
 		watchCancel:      func() {},
 		restartWatchChan: make(chan struct{}, 1),
@@ -229,6 +236,9 @@ func (f *folder) Serve(ctx context.Context) error {
 
 		case <-f.forcedRescanRequested:
 			err = f.handleForcedRescans(ctx)
+
+		case <-f.encryptedSuccessorRequested:
+			err = f.handleEncryptedSuccessors(ctx)
 
 		case <-f.scanTimer.C:
 			f.sl.DebugContext(ctx, "Scanning due to timer")
@@ -1440,6 +1450,110 @@ func (f *folder) handleForcedRescans(ctx context.Context) error {
 	}
 
 	return f.scanSubdirs(ctx, paths)
+}
+
+func (f *folder) ScheduleEncryptedSuccessors(paths []string) {
+	f.encryptedSuccessorPathsMut.Lock()
+	for _, path := range paths {
+		f.encryptedSuccessorPaths[path] = struct{}{}
+	}
+	f.encryptedSuccessorPathsMut.Unlock()
+
+	select {
+	case f.encryptedSuccessorRequested <- struct{}{}:
+	default:
+	}
+}
+
+// handleEncryptedSuccessors writes a successor version for each scheduled
+// file that an untrusted device would otherwise never pull, see
+// protocol.EncryptedSuccessor.
+func (f *folder) handleEncryptedSuccessors(_ context.Context) error {
+	f.encryptedSuccessorPathsMut.Lock()
+	paths := make([]string, 0, len(f.encryptedSuccessorPaths))
+	for path := range f.encryptedSuccessorPaths {
+		paths = append(paths, path)
+	}
+	f.encryptedSuccessorPaths = make(map[string]struct{})
+	f.encryptedSuccessorPathsMut.Unlock()
+	if len(paths) == 0 {
+		return nil
+	}
+
+	// Only folders that announce their own versions create successors.
+	if f.Type != config.FolderTypeSendReceive && f.Type != config.FolderTypeSendOnly {
+		return nil
+	}
+
+	var untrusted []protocol.DeviceID
+	for _, device := range f.Devices {
+		if device.EncryptionPassword != "" {
+			untrusted = append(untrusted, device.DeviceID)
+		}
+	}
+	if len(untrusted) == 0 {
+		return nil
+	}
+
+	batch := NewFileInfoBatch(func(fs []protocol.FileInfo) error {
+		return f.updateLocals(fs)
+	})
+
+	for _, path := range paths {
+		if err := batch.FlushIfFull(); err != nil {
+			return err
+		}
+
+		file, ok, err := f.encryptedSuccessor(path, untrusted)
+		if err != nil {
+			return err
+		}
+		if ok {
+			batch.Append(file)
+		}
+	}
+
+	return batch.Flush()
+}
+
+// encryptedSuccessor returns the local file with a successor version, if the
+// given untrusted devices would otherwise never pull it.
+func (f *folder) encryptedSuccessor(path string, untrusted []protocol.DeviceID) (protocol.FileInfo, bool, error) {
+	local, ok, err := f.db.GetDeviceFile(f.folderID, protocol.LocalDeviceID, path)
+	if err != nil || !ok {
+		return protocol.FileInfo{}, false, err
+	}
+	global, ok, err := f.db.GetGlobalFile(f.folderID, path)
+	if err != nil || !ok {
+		return protocol.FileInfo{}, false, err
+	}
+
+	// Only a device that has the global version creates the successor.
+	if local.IsInvalid() || !local.Version.Equal(global.Version) {
+		return protocol.FileInfo{}, false, nil
+	}
+
+	var versions []protocol.Vector
+	for _, device := range untrusted {
+		remote, ok, err := f.db.GetDeviceFile(f.folderID, device, path)
+		if err != nil {
+			return protocol.FileInfo{}, false, err
+		}
+		if !ok || remote.IsInvalid() || remote.Version.Equal(local.Version) {
+			continue
+		}
+		if remote.IsDeleted() && local.IsDeleted() {
+			continue
+		}
+		versions = append(versions, remote.Version)
+	}
+
+	successor, ok := protocol.EncryptedSuccessor(local.Version, versions)
+	if !ok {
+		return protocol.FileInfo{}, false, nil
+	}
+	local.Version = successor
+	return local, true, nil
 }
 
 // The exists function is expected to return true for all known paths
