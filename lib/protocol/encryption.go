@@ -14,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"strings"
 	"sync"
 
@@ -309,12 +310,10 @@ func encryptFileInfo(keyGen *KeyGenerator, fi FileInfo, folderKey *[keySize]byte
 	version := Vector{
 		Counters: []Counter{
 			{
-				ID: 1,
+				ID:    1,
+				Value: encryptedVersionValue(fi.Version),
 			},
 		},
-	}
-	for _, counter := range fi.Version.Counters {
-		version.Counters[0].Value += counter.Value
 	}
 
 	// Construct the fake block list. Each block will be blockOverhead bytes
@@ -371,6 +370,49 @@ func encryptFileInfo(keyGen *KeyGenerator, fi FileInfo, folderKey *[keySize]byte
 	}
 
 	return enc
+}
+
+// encryptedVersionValue returns the value of the single counter in the fake
+// version vector that untrusted devices see for the given real version.
+func encryptedVersionValue(real Vector) uint64 {
+	var sum uint64
+	for _, counter := range real.Counters {
+		sum += counter.Value
+	}
+	return sum
+}
+
+// encryptedSuccessorID is the counter ID used by EncryptedSuccessor. It is
+// not the short ID of any real device.
+const encryptedSuccessorID ShortID = math.MaxUint64
+
+// EncryptedSuccessor returns a successor of the given global version that
+// untrusted devices accept in place of the given versions they have. It
+// returns false if they will accept the global version as it is.
+//
+// An untrusted device only sees the fake version of a file and keeps its
+// own version when the fake version of the global one is not greater. This
+// happens when the trusted devices settle on a version with a lower sum of
+// counters, e.g. after a device was re-added with an empty database
+// (https://github.com/syncthing/syncthing/issues/9884). The untrusted device
+// would never pull the global version.
+//
+// The successor raises the counter encryptedSuccessorID just enough. It only
+// depends on its arguments, so all trusted devices create the same successor
+// and do not conflict with each other.
+func EncryptedSuccessor(global Vector, untrusted []Vector) (Vector, bool) {
+	var highest uint64
+	for _, version := range untrusted {
+		highest = max(highest, encryptedVersionValue(version))
+	}
+
+	value := encryptedVersionValue(global)
+	if value > highest {
+		return global, false
+	}
+
+	others := value - global.Counter(encryptedSuccessorID)
+	return global.Copy().updateWithNow(encryptedSuccessorID, highest-others+1), true
 }
 
 func encryptBlockHash(hash []byte, offset int64, fileKey *[keySize]byte) []byte {

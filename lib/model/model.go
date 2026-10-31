@@ -63,6 +63,7 @@ type service interface {
 	Errors() []FileError
 	WatchError() error
 	ScheduleForceRescan(path string)
+	ScheduleEncryptedSuccessors(paths []string)
 	GetStatistics() (stats.FolderStatistics, error)
 
 	getState() (folderState, time.Time, error)

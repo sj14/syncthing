@@ -28,6 +28,7 @@ type indexHandler struct {
 	downloads                *deviceDownloadState
 	folder                   string
 	folderIsReceiveEncrypted bool
+	remoteIsUntrusted        bool
 	evLogger                 events.Logger
 
 	// We track the latest / highest sequence number in two ways for two
@@ -128,11 +129,14 @@ func newIndexHandler(conn protocol.Connection, downloads *deviceDownloadState, f
 		}
 	}
 
+	folderDevice, _ := folder.Device(conn.DeviceID())
+
 	return &indexHandler{
 		conn:                     conn,
 		downloads:                downloads,
 		folder:                   folder.ID,
 		folderIsReceiveEncrypted: folder.Type == config.FolderTypeReceiveEncrypted,
+		remoteIsUntrusted:        folderDevice.EncryptionPassword != "",
 		localPrevSequence:        startSequence,
 		sentPrevSequence:         startSequence,
 		evLogger:                 evLogger,
@@ -184,6 +188,10 @@ func (s *indexHandler) Serve(ctx context.Context) (err error) {
 		return err
 	}
 	err = s.sendIndexBatch(ctx)
+	if err == nil {
+		// Files may already be stuck on an untrusted device from before
+		err = s.scheduleNeededEncryptedSuccessors()
+	}
 
 	// Subscribe to LocalIndexUpdated (we have new information to send) and
 	// DeviceDisconnected (it might be us who disconnected, so we should
@@ -278,6 +286,10 @@ func (s *indexHandler) sendIndexBatch(ctx context.Context) error {
 			panic(fmt.Sprintf("bug: once failed it should stay failed (%v)", batchError))
 		}
 		l.Debugf("%v: Sending %d files", s, len(fs))
+
+		// Before sending, as an encrypted connection replaces the files
+		// with their encrypted counterparts
+		s.scheduleEncryptedSuccessors(fs)
 
 		lastSequence := fs[len(fs)-1].Sequence
 		var err error
@@ -438,6 +450,7 @@ func (s *indexHandler) receive(fs []protocol.FileInfo, update bool, op string, p
 	if err := s.sdb.Update(s.folder, deviceID, fs); err != nil {
 		return err
 	}
+	s.scheduleEncryptedSuccessors(fs)
 	seq, err := s.sdb.GetDeviceSequence(s.folder, deviceID)
 	if err != nil {
 		return err
@@ -462,6 +475,46 @@ func (s *indexHandler) receive(fs []protocol.FileInfo, update bool, op string, p
 		"version":  seq, // legacy for sequence
 	})
 
+	return nil
+}
+
+// scheduleEncryptedSuccessors lets the folder check whether an untrusted
+// remote device would never pull the given files, see
+// protocol.EncryptedSuccessor.
+func (s *indexHandler) scheduleEncryptedSuccessors(fs []protocol.FileInfo) {
+	if !s.remoteIsUntrusted || len(fs) == 0 {
+		return
+	}
+
+	s.cond.L.Lock()
+	runner := s.runner
+	s.cond.L.Unlock()
+	if runner == nil {
+		return
+	}
+
+	paths := make([]string, len(fs))
+	for i, f := range fs {
+		paths[i] = f.Name
+	}
+	runner.ScheduleEncryptedSuccessors(paths)
+}
+
+// scheduleNeededEncryptedSuccessors does the same as
+// scheduleEncryptedSuccessors for all files the remote device needs.
+func (s *indexHandler) scheduleNeededEncryptedSuccessors() error {
+	if !s.remoteIsUntrusted {
+		return nil
+	}
+
+	var needed []protocol.FileInfo
+	for fi, err := range itererr.Zip(s.sdb.AllNeededGlobalFiles(s.folder, s.conn.DeviceID(), config.PullOrderAlphabetic, 0, 0)) {
+		if err != nil {
+			return err
+		}
+		needed = append(needed, fi)
+	}
+	s.scheduleEncryptedSuccessors(needed)
 	return nil
 }
 
